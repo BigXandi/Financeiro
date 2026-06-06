@@ -6,7 +6,7 @@
   "use strict";
 
   /* ------------------ Estado ------------------ */
-  const STORAGE_KEY = "financas-pwa:v1";
+  const STORAGE_KEY = "financas-pwa:v2";
 
   const DEFAULT_CATEGORIES = [
     { id: "salario",      name: "Salário",       type: "income",  color: "#10b981" },
@@ -29,8 +29,9 @@
     saude: "💊", educacao: "📚", compras: "🛍️", outros: "🔹"
   };
 
-  /** @typedef {{ id:string, type:"income"|"expense", amount:number, description:string, categoryId:string, date:string }} Tx */
+  /** @typedef {{ id:string, type:"income"|"expense", amount:number, description:string, categoryId:string, date:string, status?:"paid"|"pending", cardId?:string, installmentGroupId?:string, installmentNumber?:number, installmentTotal?:number }} Tx */
   /** @typedef {{ id:string, name:string, target:number, current:number, deadline?:string }} Goal */
+  /** @typedef {{ id:string, name:string, limit:number, statementBalance:number, dueDay:number }} CreditCard */
 
   let state = {
     userName: "",
@@ -40,19 +41,33 @@
     categories: DEFAULT_CATEGORIES.slice(),
     budgets: /** @type {Record<string, number>} */ ({}),
     goals: /** @type {Goal[]} */ ([]),
-    currentMonth: monthKey(new Date())
+    creditCards: /** @type {CreditCard[]} */ ([]),
+    currentMonth: monthKey(new Date()),
+    selectedCalDay: /** @type {number|null} */ (null)
   };
 
   /* ------------------ Persistência ------------------ */
   function loadState() {
     try {
-      const raw = localStorage.getItem(STORAGE_KEY);
-      if (!raw) return;
+      let raw = localStorage.getItem(STORAGE_KEY);
+      if (!raw) {
+        raw = localStorage.getItem("financas-pwa:v1");
+        if (raw) {
+          const data = JSON.parse(raw);
+          state = { ...state, ...data, creditCards: data.creditCards || [] };
+          state.transactions = (state.transactions || []).map(t => ({ ...t, status: t.status || "paid" }));
+          saveState();
+          return;
+        }
+        return;
+      }
       const data = JSON.parse(raw);
       state = { ...state, ...data };
       if (!state.categories || state.categories.length === 0) {
         state.categories = DEFAULT_CATEGORIES.slice();
       }
+      if (!state.creditCards) state.creditCards = [];
+      state.transactions = (state.transactions || []).map(t => ({ ...t, status: t.status || "paid" }));
       state.currentMonth = monthKey(new Date());
     } catch (e) {
       console.error("Erro lendo localStorage", e);
@@ -114,8 +129,68 @@
     return state.categories.find(c => c.id === id) || { id, name: id, type: "expense", color: "#64748b" };
   }
 
+  function cardById(id) {
+    return state.creditCards.find(c => c.id === id);
+  }
+
+  function txStatus(tx) {
+    return tx.status || "paid";
+  }
+
+  function isPending(tx) {
+    return txStatus(tx) === "pending";
+  }
+
+  function isOverdue(tx) {
+    return isPending(tx) && tx.date < todayIso();
+  }
+
   function txInMonth(tx, mk) {
     return tx.date.startsWith(mk);
+  }
+
+  function monthTotals(mk) {
+    const txs = state.transactions.filter(t => txInMonth(t, mk));
+    const paid = txs.filter(t => !isPending(t));
+    const pending = txs.filter(t => isPending(t));
+    const incomePaid = paid.filter(t => t.type === "income").reduce((s, t) => s + t.amount, 0);
+    const expensePaid = paid.filter(t => t.type === "expense").reduce((s, t) => s + t.amount, 0);
+    const incomePending = pending.filter(t => t.type === "income").reduce((s, t) => s + t.amount, 0);
+    const expensePending = pending.filter(t => t.type === "expense").reduce((s, t) => s + t.amount, 0);
+    return {
+      incomePaid, expensePaid, balancePaid: incomePaid - expensePaid,
+      incomePending, expensePending,
+      balanceProjected: (incomePaid + incomePending) - (expensePaid + expensePending)
+    };
+  }
+
+  function addMonthsIso(iso, months) {
+    const [y, m, d] = iso.split("-").map(Number);
+    const dt = new Date(y, m - 1 + months, d);
+    return `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, "0")}-${String(dt.getDate()).padStart(2, "0")}`;
+  }
+
+  function isoFromParts(y, m, d) {
+    return `${y}-${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
+  }
+
+  function cardPendingTotal(cardId) {
+    return state.transactions
+      .filter(t => t.cardId === cardId && t.type === "expense" && isPending(t))
+      .reduce((s, t) => s + t.amount, 0);
+  }
+
+  function cardProjectedBalance(card) {
+    return (card.statementBalance || 0) + cardPendingTotal(card.id);
+  }
+
+  function nextCardDueIso(card, ref = new Date()) {
+    const y = ref.getFullYear();
+    const m = ref.getMonth();
+    const day = Math.min(card.dueDay, 28);
+    let due = new Date(y, m, day);
+    if (due < ref) due = new Date(y, m + 1, day);
+    return isoFromParts(due.getFullYear(), due.getMonth() + 1, due.getDate());
   }
 
   function toast(msg, ms = 2200) {
@@ -149,7 +224,7 @@
   function showScreen(name) {
     document.querySelectorAll(".screen").forEach(s => s.classList.toggle("active", s.dataset.screen === name));
     document.querySelectorAll(".nav-item").forEach(b => b.classList.toggle("active", b.dataset.go === name));
-    const titles = { dashboard: "Resumo", transactions: "Transações", budgets: "Orçamentos & Metas", settings: "Configurações" };
+    const titles = { dashboard: "Resumo", transactions: "Transações", planning: "Planejamento", settings: "Configurações" };
     document.getElementById("screenTitle").textContent = titles[name] || "Finanças";
     window.scrollTo({ top: 0 });
   }
@@ -167,23 +242,32 @@
     const [y, m] = state.currentMonth.split("-").map(Number);
     const d = new Date(y, m - 1 + delta, 1);
     state.currentMonth = monthKey(d);
+    state.selectedCalDay = null;
     renderDashboard();
+    renderPlanning();
   }
 
   function renderDashboard() {
     document.getElementById("monthLabel").textContent =
       monthLabel(state.currentMonth).replace(/^./, c => c.toUpperCase());
 
-    const txs = state.transactions.filter(t => txInMonth(t, state.currentMonth));
-    const income = txs.filter(t => t.type === "income").reduce((s, t) => s + t.amount, 0);
-    const expense = txs.filter(t => t.type === "expense").reduce((s, t) => s + t.amount, 0);
-    const balance = income - expense;
+    const totals = monthTotals(state.currentMonth);
+    document.getElementById("balanceValue").textContent = formatMoney(totals.balancePaid);
+    document.getElementById("incomeValue").textContent = formatMoney(totals.incomePaid);
+    document.getElementById("expenseValue").textContent = formatMoney(totals.expensePaid);
 
-    document.getElementById("balanceValue").textContent = formatMoney(balance);
-    document.getElementById("incomeValue").textContent = formatMoney(income);
-    document.getElementById("expenseValue").textContent = formatMoney(expense);
+    const projEl = document.getElementById("balanceProjection");
+    const pendingCount = state.transactions.filter(t => isPending(t) && txInMonth(t, state.currentMonth)).length;
+    if (pendingCount > 0 || totals.balanceProjected !== totals.balancePaid) {
+      const diff = totals.balanceProjected - totals.balancePaid;
+      const sign = diff >= 0 ? "+" : "−";
+      projEl.innerHTML = `Projeção com agendados: <strong>${formatMoney(totals.balanceProjected)}</strong> (${sign}${formatMoney(Math.abs(diff))}) · ${pendingCount} pendente${pendingCount !== 1 ? "s" : ""}`;
+    } else {
+      projEl.textContent = "";
+    }
 
-    renderCategoryChart(txs);
+    const monthTxs = state.transactions.filter(t => txInMonth(t, state.currentMonth) && !isPending(t));
+    renderCategoryChart(monthTxs);
     renderTrendChart();
     renderRecent();
   }
@@ -246,12 +330,8 @@
       months.push(monthKey(d));
     }
     const data = months.map(mk => {
-      const txs = state.transactions.filter(t => txInMonth(t, mk));
-      return {
-        mk,
-        income: txs.filter(t => t.type === "income").reduce((s, t) => s + t.amount, 0),
-        expense: txs.filter(t => t.type === "expense").reduce((s, t) => s + t.amount, 0)
-      };
+      const t = monthTotals(mk);
+      return { mk, income: t.incomePaid, expense: t.expensePaid };
     });
 
     const max = Math.max(1, ...data.flatMap(d => [d.income, d.expense]));
@@ -301,16 +381,27 @@
     });
   }
 
+  function txStatusBadge(tx) {
+    if (!isPending(tx)) return "";
+    const cls = isOverdue(tx) ? "overdue" : "pending";
+    const label = isOverdue(tx) ? "Atrasado" : "Agendado";
+    return `<span class="tx-badge ${cls}">${label}</span>`;
+  }
+
   function txItemHTML(tx) {
     const cat = categoryById(tx.categoryId);
     const icon = CATEGORY_ICONS[cat.id] || (tx.type === "income" ? "💰" : "💸");
     const sign = tx.type === "income" ? "+" : "−";
+    const card = tx.cardId ? cardById(tx.cardId) : null;
+    const inst = tx.installmentTotal > 1 ? ` · ${tx.installmentNumber}/${tx.installmentTotal}` : "";
+    const dateLabel = isPending(tx) ? `Vence ${formatDate(tx.date)}` : formatDate(tx.date);
+    const pendingCls = isPending(tx) ? " pending" : "";
     return `
-      <li class="tx-item" data-tx="${tx.id}">
+      <li class="tx-item${pendingCls}" data-tx="${tx.id}">
         <div class="tx-icon ${tx.type}">${icon}</div>
         <div class="tx-body">
-          <div class="tx-desc">${escapeHtml(tx.description)}</div>
-          <div class="tx-meta">${cat.name} · ${formatDate(tx.date)}</div>
+          <div class="tx-desc">${escapeHtml(tx.description)}${txStatusBadge(tx)}</div>
+          <div class="tx-meta">${cat.name}${card ? " · " + escapeHtml(card.name) : ""}${inst} · ${dateLabel}</div>
         </div>
         <div class="tx-amount ${tx.type}">${sign}${formatMoney(tx.amount)}</div>
       </li>`;
@@ -328,7 +419,8 @@
     const empty = document.getElementById("emptyTx");
     const q = txFilter.q.trim().toLowerCase();
     let txs = state.transactions.slice();
-    if (txFilter.type !== "all") txs = txs.filter(t => t.type === txFilter.type);
+    if (txFilter.type === "pending") txs = txs.filter(t => isPending(t));
+    else if (txFilter.type !== "all") txs = txs.filter(t => t.type === txFilter.type);
     if (q) {
       txs = txs.filter(t => {
         const cat = categoryById(t.categoryId);
@@ -372,18 +464,38 @@
     sel.innerHTML = opts.map(c => `<option value="${c.id}">${c.name}</option>`).join("");
   }
 
-  function openTxModal(id) {
+  function refreshTxCardSelect() {
+    const sel = document.getElementById("txCard");
+    sel.innerHTML = `<option value="">Nenhum</option>` +
+      state.creditCards.map(c => `<option value="${c.id}">${escapeHtml(c.name)}</option>`).join("");
+  }
+
+  function setTxStatus(status) {
+    document.getElementById("txStatusSwitch").dataset.status = status;
+    document.querySelectorAll("#txStatusSwitch button").forEach(b =>
+      b.classList.toggle("active", b.dataset.status === status)
+    );
+    const pending = status === "pending";
+    document.getElementById("txDateLabel").textContent = pending ? "Data de vencimento" : "Data";
+    document.getElementById("txInstallmentFields").classList.toggle("hidden", !pending);
+    document.getElementById("txCardField").classList.toggle("hidden", document.getElementById("txType").value === "income");
+  }
+
+  function openTxModal(id, opts = {}) {
     const modal = document.getElementById("txModal");
     const titleEl = document.getElementById("txModalTitle");
     const delBtn = document.getElementById("txDeleteBtn");
+    const payBtn = document.getElementById("txPayBtn");
     const form = document.getElementById("txForm");
     form.reset();
+    refreshTxCardSelect();
 
     if (id) {
       const tx = state.transactions.find(t => t.id === id);
       if (!tx) return;
-      titleEl.textContent = "Editar transação";
+      titleEl.textContent = isPending(tx) ? "Editar agendamento" : "Editar transação";
       delBtn.classList.remove("hidden");
+      payBtn.classList.toggle("hidden", !isPending(tx));
       document.getElementById("txId").value = tx.id;
       setTxType(tx.type);
       document.getElementById("txAmount").value = tx.amount.toFixed(2).replace(".", ",");
@@ -391,14 +503,22 @@
       refreshTxCategorySelect();
       document.getElementById("txCategory").value = tx.categoryId;
       document.getElementById("txDate").value = tx.date;
+      setTxStatus(txStatus(tx));
+      document.getElementById("txCard").value = tx.cardId || "";
+      document.getElementById("txInstallments").value = "1";
+      document.getElementById("txInstallmentFields").classList.add("hidden");
     } else {
-      titleEl.textContent = "Nova transação";
+      titleEl.textContent = opts.planned ? "Agendar conta" : "Nova transação";
       delBtn.classList.add("hidden");
+      payBtn.classList.add("hidden");
       document.getElementById("txId").value = "";
-      setTxType("expense");
+      setTxType(opts.type || "expense");
       document.getElementById("txDate").value = todayIso();
+      setTxStatus(opts.planned ? "pending" : "paid");
       refreshTxCategorySelect();
+      document.getElementById("txInstallments").value = "1";
     }
+    document.getElementById("txCardField").classList.toggle("hidden", document.getElementById("txType").value === "income");
     openModal(modal);
   }
 
@@ -408,43 +528,464 @@
       b.classList.toggle("active", b.dataset.type === type)
     );
     refreshTxCategorySelect();
+    document.getElementById("txCardField").classList.toggle("hidden", type === "income");
+  }
+
+  function buildTxFromForm() {
+    const status = document.getElementById("txStatusSwitch").dataset.status || "paid";
+    const cardId = document.getElementById("txCard").value || undefined;
+    return {
+      type: document.getElementById("txType").value,
+      amount: parseAmount(document.getElementById("txAmount").value),
+      description: document.getElementById("txDescription").value.trim() || "Sem descrição",
+      categoryId: document.getElementById("txCategory").value,
+      date: document.getElementById("txDate").value || todayIso(),
+      status,
+      cardId: status === "pending" ? cardId : (cardId || undefined)
+    };
+  }
+
+  function updateCardStatement(cardId, delta) {
+    const card = cardById(cardId);
+    if (card) card.statementBalance = Math.max(0, (card.statementBalance || 0) + delta);
   }
 
   function submitTx(e) {
     e.preventDefault();
     const id = document.getElementById("txId").value;
-    const amount = parseAmount(document.getElementById("txAmount").value);
-    if (amount <= 0) { toast("Informe um valor válido."); return; }
-    const tx = {
-      id: id || uid(),
-      type: document.getElementById("txType").value,
-      amount,
-      description: document.getElementById("txDescription").value.trim() || "Sem descrição",
-      categoryId: document.getElementById("txCategory").value,
-      date: document.getElementById("txDate").value || todayIso()
-    };
+    const base = buildTxFromForm();
+    if (base.amount <= 0) { toast("Informe um valor válido."); return; }
+
     if (id) {
+      const prev = state.transactions.find(t => t.id === id);
+      const tx = { ...prev, ...base, id };
       const idx = state.transactions.findIndex(t => t.id === id);
       state.transactions[idx] = tx;
-      toast("Transação atualizada.");
+      if (prev?.cardId && prev.type === "expense" && !isPending(prev)) {
+        updateCardStatement(prev.cardId, -prev.amount);
+      }
+      if (tx.cardId && tx.type === "expense" && !isPending(tx)) {
+        updateCardStatement(tx.cardId, tx.amount);
+      }
+      toast(isPending(tx) ? "Agendamento atualizado." : "Transação atualizada.");
     } else {
-      state.transactions.push(tx);
-      toast("Transação adicionada.");
+      const installments = Math.max(1, parseInt(document.getElementById("txInstallments").value, 10) || 1);
+      const isPlanned = base.status === "pending" && installments > 1;
+      if (isPlanned) {
+        const groupId = uid();
+        const parcel = Math.round((base.amount / installments) * 100) / 100;
+        let remainder = base.amount;
+        for (let i = 0; i < installments; i++) {
+          const amt = i === installments - 1 ? remainder : parcel;
+          remainder -= amt;
+          state.transactions.push({
+            id: uid(),
+            ...base,
+            amount: amt,
+            description: `${base.description} (${i + 1}/${installments})`,
+            date: addMonthsIso(base.date, i),
+            installmentGroupId: groupId,
+            installmentNumber: i + 1,
+            installmentTotal: installments
+          });
+        }
+        toast(`${installments} parcelas agendadas.`);
+      } else {
+        const tx = { id: uid(), ...base };
+        state.transactions.push(tx);
+        if (tx.cardId && tx.type === "expense" && !isPending(tx)) {
+          updateCardStatement(tx.cardId, tx.amount);
+        }
+        if (isPending(tx) && tx.cardId) {
+          const card = cardById(tx.cardId);
+          toast(`Agendado. Projeção ${card?.name}: ${formatMoney(cardProjectedBalance(card))}.`);
+        } else {
+          toast(isPending(tx) ? "Conta agendada." : "Transação adicionada.");
+        }
+      }
     }
     saveState();
     closeAllModals();
     renderAll();
   }
 
-  function deleteTx() {
+  function markTxAsPaid() {
     const id = document.getElementById("txId").value;
     if (!id) return;
-    if (!confirm("Excluir esta transação?")) return;
-    state.transactions = state.transactions.filter(t => t.id !== id);
+    const tx = state.transactions.find(t => t.id === id);
+    if (!tx || !isPending(tx)) return;
+    tx.status = "paid";
+    tx.date = todayIso();
+    if (tx.cardId && tx.type === "expense") {
+      updateCardStatement(tx.cardId, tx.amount);
+    }
     saveState();
     closeAllModals();
     renderAll();
-    toast("Transação excluída.");
+    toast(tx.type === "income" ? "Recebimento confirmado." : "Pagamento confirmado.");
+  }
+
+  function deleteTx() {
+    const id = document.getElementById("txId").value;
+    if (!id) return;
+    const tx = state.transactions.find(t => t.id === id);
+    if (!tx) return;
+    const msg = tx.installmentGroupId
+      ? "Excluir todas as parcelas deste agendamento?"
+      : "Excluir esta transação?";
+    if (!confirm(msg)) return;
+    if (tx.installmentGroupId) {
+      state.transactions = state.transactions.filter(t => t.installmentGroupId !== tx.installmentGroupId);
+    } else {
+      if (tx.cardId && tx.type === "expense" && !isPending(tx)) {
+        updateCardStatement(tx.cardId, -tx.amount);
+      }
+      state.transactions = state.transactions.filter(t => t.id !== id);
+    }
+    saveState();
+    closeAllModals();
+    renderAll();
+    toast("Excluído.");
+  }
+
+  /* ------------------ Planejamento ------------------ */
+  function renderPlanning() {
+    const mk = state.currentMonth;
+    const totals = monthTotals(mk);
+    document.getElementById("planningMonthLabel").textContent =
+      monthLabel(mk).replace(/^./, c => c.toUpperCase());
+    document.getElementById("planRealized").textContent = formatMoney(totals.balancePaid);
+    document.getElementById("planProjected").textContent = formatMoney(totals.balanceProjected);
+    document.getElementById("planPendingOut").textContent = formatMoney(totals.expensePending);
+    document.getElementById("planPendingIn").textContent = formatMoney(totals.incomePending);
+    renderPlannedList();
+    renderCreditCards();
+    renderCalendar();
+  }
+
+  function getCalendarEvents(mk) {
+    const [y, m] = mk.split("-").map(Number);
+    /** @type {{ date:string, kind:string, label:string, amount?:number, type?:string, id?:string, overdue?:boolean }[]} */
+    const events = [];
+
+    state.transactions.filter(t => txInMonth(t, mk)).forEach(tx => {
+      events.push({
+        date: tx.date,
+        kind: isPending(tx) ? (isOverdue(tx) ? "overdue" : tx.type) : "paid-" + tx.type,
+        label: tx.description,
+        amount: tx.amount,
+        type: tx.type,
+        id: tx.id,
+        overdue: isOverdue(tx)
+      });
+    });
+
+    state.creditCards.forEach(card => {
+      const day = Math.min(card.dueDay, 28);
+      const date = isoFromParts(y, m, day);
+      const projected = cardProjectedBalance(card);
+      events.push({
+        date,
+        kind: "card",
+        label: `Fatura ${card.name}`,
+        amount: projected,
+        type: "card",
+        id: card.id
+      });
+    });
+
+    return events.sort((a, b) => a.date.localeCompare(b.date));
+  }
+
+  function renderCalendar() {
+    const calEl = document.getElementById("dueCalendar");
+    const labelEl = document.getElementById("calMonthLabel");
+    if (!calEl) return;
+
+    const mk = state.currentMonth;
+    const [y, m] = mk.split("-").map(Number);
+    labelEl.textContent = monthLabel(mk).replace(/^./, c => c.toUpperCase());
+
+    const events = getCalendarEvents(mk);
+    const byDay = {};
+    events.forEach(ev => {
+      const day = parseInt(ev.date.split("-")[2], 10);
+      (byDay[day] = byDay[day] || []).push(ev);
+    });
+
+    const first = new Date(y, m - 1, 1);
+    const daysInMonth = new Date(y, m, 0).getDate();
+    const startPad = first.getDay();
+    const today = todayIso();
+    const weekdays = ["Dom", "Seg", "Ter", "Qua", "Qui", "Sex", "Sáb"];
+
+    let html = weekdays.map(w => `<div class="cal-weekday">${w}</div>`).join("");
+    for (let i = 0; i < startPad; i++) html += `<div class="cal-day empty" aria-hidden="true"></div>`;
+
+    for (let day = 1; day <= daysInMonth; day++) {
+      const iso = isoFromParts(y, m, day);
+      const dayEvents = byDay[day] || [];
+      const classes = ["cal-day"];
+      if (iso === today) classes.push("today");
+      if (state.selectedCalDay === day) classes.push("selected");
+      if (dayEvents.length) classes.push("has-events");
+
+      const dots = dayEvents.slice(0, 4).map(ev => {
+        let cls = "expense";
+        if (ev.kind === "card") cls = "card";
+        else if (ev.kind === "income") cls = "income";
+        else if (ev.overdue || ev.kind === "overdue") cls = "overdue";
+        return `<span class="cal-dot ${cls}"></span>`;
+      }).join("");
+
+      html += `
+        <button type="button" class="${classes.join(" ")}" data-cal-day="${day}" aria-label="Dia ${day}">
+          <span>${day}</span>
+          ${dots ? `<span class="cal-dots">${dots}</span>` : ""}
+        </button>`;
+    }
+
+    calEl.innerHTML = html;
+    calEl.querySelectorAll("[data-cal-day]").forEach(btn => {
+      btn.addEventListener("click", () => selectCalDay(parseInt(btn.dataset.calDay, 10)));
+    });
+
+    if (state.selectedCalDay) renderCalDayDetail(state.selectedCalDay);
+    else document.getElementById("calDayDetail").classList.add("hidden");
+  }
+
+  function selectCalDay(day) {
+    state.selectedCalDay = state.selectedCalDay === day ? null : day;
+    renderCalendar();
+  }
+
+  function renderCalDayDetail(day) {
+    const wrap = document.getElementById("calDayDetail");
+    const title = document.getElementById("calDayTitle");
+    const list = document.getElementById("calDayList");
+    const [y, m] = state.currentMonth.split("-").map(Number);
+    const iso = isoFromParts(y, m, day);
+    const events = getCalendarEvents(state.currentMonth).filter(ev => ev.date === iso);
+
+    if (!state.selectedCalDay || events.length === 0) {
+      wrap.classList.toggle("hidden", !state.selectedCalDay);
+      if (state.selectedCalDay && events.length === 0) {
+        title.textContent = `${formatDate(iso)} — sem vencimentos`;
+        list.innerHTML = "";
+        wrap.classList.remove("hidden");
+      }
+      return;
+    }
+
+    wrap.classList.remove("hidden");
+    title.textContent = formatDate(iso);
+    list.innerHTML = events.map(ev => {
+      if (ev.type === "card") {
+        const card = cardById(ev.id);
+        const pending = card ? cardPendingTotal(card.id) : 0;
+        const current = card ? card.statementBalance : 0;
+        return `
+          <li data-card="${ev.id}">
+            <div>
+              <span class="cal-ev-label">💳 ${escapeHtml(ev.label)}</span>
+              ${pending > 0 ? `<span class="muted" style="font-size:.75rem;display:block;margin-top:2px">${formatMoney(current)} + ${formatMoney(pending)} agendado</span>` : ""}
+            </div>
+            <span class="cal-ev-amount">${formatMoney(ev.amount)}</span>
+          </li>`;
+      }
+      const sign = ev.type === "income" ? "+" : "−";
+      const status = ev.overdue ? " (atrasado)" : (ev.kind.startsWith("paid") ? "" : " (agendado)");
+      return `
+        <li class="${ev.overdue ? "overdue" : ""}" data-tx="${ev.id}">
+          <span class="cal-ev-label">${ev.type === "income" ? "📥" : "📤"} ${escapeHtml(ev.label)}${status}</span>
+          <span class="cal-ev-amount">${sign}${formatMoney(ev.amount)}</span>
+        </li>`;
+    }).join("");
+
+    list.querySelectorAll("[data-tx]").forEach(el => {
+      el.addEventListener("click", () => openTxModal(el.dataset.tx));
+    });
+    list.querySelectorAll("[data-card]").forEach(el => {
+      el.addEventListener("click", () => openCardModal(el.dataset.card));
+    });
+  }
+
+  function renderPlannedList() {
+    const list = document.getElementById("plannedList");
+    const empty = document.getElementById("emptyPlanned");
+    const pending = state.transactions
+      .filter(t => isPending(t))
+      .sort((a, b) => (a.date > b.date ? 1 : a.date < b.date ? -1 : 0));
+
+    if (pending.length === 0) {
+      list.innerHTML = "";
+      empty.classList.remove("hidden");
+      return;
+    }
+    empty.classList.add("hidden");
+    list.innerHTML = pending.map(tx => {
+      const cat = categoryById(tx.categoryId);
+      const card = tx.cardId ? cardById(tx.cardId) : null;
+      const overdue = isOverdue(tx);
+      const inst = tx.installmentTotal > 1 ? `Parcela ${tx.installmentNumber}/${tx.installmentTotal}` : "";
+      return `
+        <li class="planned-item${overdue ? " overdue" : ""}" data-planned="${tx.id}">
+          <div class="planned-head">
+            <span>${tx.type === "income" ? "📥" : "📤"} ${escapeHtml(tx.description)}</span>
+            <span class="${tx.type}">${tx.type === "income" ? "+" : "−"}${formatMoney(tx.amount)}</span>
+          </div>
+          <div class="planned-meta">
+            <span>${cat.name}${card ? " · " + escapeHtml(card.name) : ""}</span>
+            <span>${overdue ? "⚠ Atrasado · " : ""}Vence ${formatDate(tx.date)}${inst ? " · " + inst : ""}</span>
+          </div>
+          <div class="planned-actions">
+            <button type="button" class="btn success" data-pay="${tx.id}">${tx.type === "income" ? "Recebi" : "Paguei"}</button>
+            <button type="button" class="btn ghost" data-edit="${tx.id}">Editar</button>
+          </div>
+        </li>`;
+    }).join("");
+
+    list.querySelectorAll("[data-pay]").forEach(btn => {
+      btn.addEventListener("click", e => {
+        e.stopPropagation();
+        quickPay(btn.dataset.pay);
+      });
+    });
+    list.querySelectorAll("[data-edit]").forEach(btn => {
+      btn.addEventListener("click", e => {
+        e.stopPropagation();
+        openTxModal(btn.dataset.edit);
+      });
+    });
+    list.querySelectorAll("[data-planned]").forEach(el => {
+      el.addEventListener("click", () => openTxModal(el.dataset.planned));
+    });
+  }
+
+  function quickPay(id) {
+    const tx = state.transactions.find(t => t.id === id);
+    if (!tx || !isPending(tx)) return;
+    tx.status = "paid";
+    tx.date = todayIso();
+    if (tx.cardId && tx.type === "expense") {
+      updateCardStatement(tx.cardId, tx.amount);
+    }
+    saveState();
+    renderAll();
+    toast(tx.type === "income" ? "Recebimento confirmado." : "Pagamento confirmado.");
+  }
+
+  function renderCreditCards() {
+    const list = document.getElementById("cardList");
+    const empty = document.getElementById("emptyCards");
+    if (state.creditCards.length === 0) {
+      list.innerHTML = "";
+      empty.classList.remove("hidden");
+      return;
+    }
+    empty.classList.add("hidden");
+    list.innerHTML = state.creditCards.map(card => {
+      const used = card.statementBalance || 0;
+      const pending = cardPendingTotal(card.id);
+      const projected = used + pending;
+      const limit = card.limit || 1;
+      const pct = Math.min(100, (projected / limit) * 100);
+      const available = limit - projected;
+      const over = projected > limit;
+      const dueIso = nextCardDueIso(card);
+      const dueLabel = `Próx. vencimento: ${formatDate(dueIso)}`;
+      const projectionHtml = pending > 0
+        ? `<div class="card-projection">Projeção: <strong>${formatMoney(projected)}</strong> (${formatMoney(used)} fatura + ${formatMoney(pending)} agendado) · Disponível projetado: <strong>${formatMoney(available)}</strong></div>`
+        : "";
+      return `
+        <li class="credit-card-item" data-card="${card.id}">
+          <div class="card-head">
+            <span>💳 ${escapeHtml(card.name)}</span>
+            <span>${formatMoney(pending > 0 ? projected : used)}</span>
+          </div>
+          <div class="card-limit-bar${over ? " over" : ""}"><span style="width:${pct}%"></span></div>
+          <div class="card-meta">
+            <span>Fatura / Limite: ${formatMoney(used)} / ${formatMoney(limit)}</span>
+            <span>Disponível: ${formatMoney(limit - (pending > 0 ? projected : used))}</span>
+          </div>
+          <div class="card-meta"><span>${dueLabel}</span></div>
+          ${projectionHtml}
+        </li>`;
+    }).join("");
+
+    list.querySelectorAll("[data-card]").forEach(el => {
+      el.addEventListener("click", () => openCardModal(el.dataset.card));
+    });
+  }
+
+  function populateDueDaySelect() {
+    const sel = document.getElementById("cardDueDay");
+    if (sel.options.length) return;
+    sel.innerHTML = Array.from({ length: 28 }, (_, i) => {
+      const d = i + 1;
+      return `<option value="${d}">Dia ${d}</option>`;
+    }).join("");
+  }
+
+  function openCardModal(id) {
+    populateDueDaySelect();
+    const form = document.getElementById("cardForm");
+    const delBtn = document.getElementById("cardDeleteBtn");
+    form.reset();
+    if (id) {
+      const card = cardById(id);
+      if (!card) return;
+      document.getElementById("cardModalTitle").textContent = "Editar cartão";
+      document.getElementById("cardId").value = card.id;
+      document.getElementById("cardName").value = card.name;
+      document.getElementById("cardLimit").value = card.limit.toFixed(2).replace(".", ",");
+      document.getElementById("cardStatement").value = card.statementBalance.toFixed(2).replace(".", ",");
+      document.getElementById("cardDueDay").value = String(card.dueDay);
+      delBtn.classList.remove("hidden");
+    } else {
+      document.getElementById("cardModalTitle").textContent = "Novo cartão";
+      document.getElementById("cardId").value = "";
+      document.getElementById("cardDueDay").value = "10";
+      delBtn.classList.add("hidden");
+    }
+    openModal(document.getElementById("cardModal"));
+  }
+
+  function submitCard(e) {
+    e.preventDefault();
+    const id = document.getElementById("cardId").value;
+    const card = {
+      id: id || uid(),
+      name: document.getElementById("cardName").value.trim() || "Cartão",
+      limit: parseAmount(document.getElementById("cardLimit").value),
+      statementBalance: parseAmount(document.getElementById("cardStatement").value),
+      dueDay: parseInt(document.getElementById("cardDueDay").value, 10) || 10
+    };
+    if (card.limit <= 0) { toast("Informe um limite válido."); return; }
+    if (id) {
+      const idx = state.creditCards.findIndex(c => c.id === id);
+      state.creditCards[idx] = card;
+      toast("Cartão atualizado.");
+    } else {
+      state.creditCards.push(card);
+      toast("Cartão cadastrado.");
+    }
+    saveState();
+    closeAllModals();
+    renderPlanning();
+    refreshTxCardSelect();
+  }
+
+  function deleteCard() {
+    const id = document.getElementById("cardId").value;
+    if (!id) return;
+    if (!confirm("Excluir este cartão? Transações vinculadas perderão a referência.")) return;
+    state.creditCards = state.creditCards.filter(c => c.id !== id);
+    state.transactions.forEach(t => { if (t.cardId === id) delete t.cardId; });
+    saveState();
+    closeAllModals();
+    renderAll();
+    toast("Cartão excluído.");
   }
 
   /* ------------------ Orçamentos ------------------ */
@@ -462,7 +1003,7 @@
     list.innerHTML = keys.map(catId => {
       const limit = state.budgets[catId];
       const spent = state.transactions
-        .filter(t => t.type === "expense" && t.categoryId === catId && txInMonth(t, cm))
+        .filter(t => t.type === "expense" && !isPending(t) && t.categoryId === catId && txInMonth(t, cm))
         .reduce((s, t) => s + t.amount, 0);
       const pct = Math.min(100, (spent / limit) * 100);
       const over = spent > limit;
@@ -690,7 +1231,7 @@
     state = {
       userName: "", currency: "BRL", theme: "auto",
       transactions: [], categories: DEFAULT_CATEGORIES.slice(),
-      budgets: {}, goals: [], currentMonth: monthKey(new Date())
+      budgets: {}, goals: [], creditCards: [], currentMonth: monthKey(new Date()), selectedCalDay: null
     };
     saveState();
     renderAll();
@@ -716,6 +1257,7 @@
     renderGreeting();
     renderDashboard();
     renderTransactions();
+    renderPlanning();
     renderBudgets();
     renderGoals();
     renderSettings();
@@ -731,6 +1273,8 @@
 
     document.getElementById("prevMonth").addEventListener("click", () => changeMonth(-1));
     document.getElementById("nextMonth").addEventListener("click", () => changeMonth(1));
+    document.getElementById("calPrevMonth").addEventListener("click", () => changeMonth(-1));
+    document.getElementById("calNextMonth").addEventListener("click", () => changeMonth(1));
 
     document.getElementById("fabAdd").addEventListener("click", () => openTxModal());
 
@@ -738,8 +1282,13 @@
       b.addEventListener("click", () => setTxType(b.dataset.type));
     });
 
+    document.querySelectorAll("#txStatusSwitch button").forEach(b => {
+      b.addEventListener("click", () => setTxStatus(b.dataset.status));
+    });
+
     document.getElementById("txForm").addEventListener("submit", submitTx);
     document.getElementById("txDeleteBtn").addEventListener("click", deleteTx);
+    document.getElementById("txPayBtn").addEventListener("click", markTxAsPaid);
 
     document.querySelectorAll("[data-close]").forEach(el => {
       el.addEventListener("click", closeAllModals);
@@ -757,6 +1306,11 @@
         renderTransactions();
       });
     });
+
+    document.getElementById("addPlannedBtn").addEventListener("click", () => openTxModal(null, { planned: true }));
+    document.getElementById("addCardBtn").addEventListener("click", () => openCardModal());
+    document.getElementById("cardForm").addEventListener("submit", submitCard);
+    document.getElementById("cardDeleteBtn").addEventListener("click", deleteCard);
 
     document.getElementById("addBudgetBtn").addEventListener("click", () => openBudgetModal());
     document.getElementById("budgetForm").addEventListener("submit", submitBudget);
@@ -807,9 +1361,11 @@
 
     const action = new URLSearchParams(location.search).get("action");
     if (action === "new-expense") {
-      setTimeout(() => { openTxModal(); setTxType("expense"); }, 400);
+      setTimeout(() => { openTxModal(null, { type: "expense" }); }, 400);
     } else if (action === "new-income") {
-      setTimeout(() => { openTxModal(); setTxType("income"); }, 400);
+      setTimeout(() => { openTxModal(null, { type: "income" }); }, 400);
+    } else if (action === "new-planned") {
+      setTimeout(() => { openTxModal(null, { planned: true }); }, 400);
     }
 
     if ("serviceWorker" in navigator) {
