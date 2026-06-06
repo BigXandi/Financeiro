@@ -169,7 +169,7 @@
       <article class="card">
         <div class="card-header">
           <h3>Contas agendadas</h3>
-          <button class="link-btn" id="addPlannedBtn">+ Agendar</button>
+          <button type="button" class="link-btn" id="addPlannedBtn">+ Agendar</button>
         </div>
         <p class="muted">Despesas e receitas futuras que ainda não foram liquidadas.</p>
         <ul id="plannedList" class="planned-list"></ul>
@@ -179,17 +179,17 @@
       <article class="card">
         <div class="card-header">
           <h3>Cartões de crédito</h3>
-          <button class="link-btn" id="addCardBtn">+ Cartão</button>
+          <button type="button" class="link-btn" id="addCardBtn">+ Cartão</button>
         </div>
         <p class="muted">Limite, fatura atual e vencimento para planejar seus gastos no crédito.</p>
         <ul id="cardList" class="card-list"></ul>
-        <p id="emptyCards" class="empty hidden">Cadastre seus cartões para acompanhar limite e faturas.</p>
+        <p id="emptyCards" class="empty hidden">Cadastre seus cartões para acompanhar limite e faturas.<br><button type="button" class="btn primary small" id="emptyAddCardBtn" style="margin-top:12px">+ Cadastrar cartão</button></p>
       </article>
 
       <article class="card">
         <div class="card-header">
           <h3>Orçamentos mensais</h3>
-          <button class="link-btn" id="addBudgetBtn">+ Novo</button>
+          <button type="button" class="link-btn" id="addBudgetBtn">+ Novo</button>
         </div>
         <p class="muted">Defina um limite para cada categoria e acompanhe seu consumo no mês atual.</p>
         <ul id="budgetList" class="budget-list"></ul>
@@ -199,7 +199,7 @@
       <article class="card">
         <div class="card-header">
           <h3>Metas de economia</h3>
-          <button class="link-btn" id="addGoalBtn">+ Nova</button>
+          <button type="button" class="link-btn" id="addGoalBtn">+ Nova</button>
         </div>
         <p class="muted">Crie objetivos (viagem, reserva de emergência, etc.) e registre depósitos.</p>
         <ul id="goalList" class="goal-list"></ul>
@@ -319,11 +319,9 @@
           <input type="date" id="txDate" required />
         </label>
 
-        <label class="field" id="txCardField">
-          <span>Cartão (opcional)</span>
-          <select id="txCard">
-            <option value="">Nenhum</option>
-          </select>
+        <label class="field" id="txPaymentField">
+          <span id="txPaymentLabel">Forma de pagamento</span>
+          <select id="txPayment"></select>
         </label>
 
         <div id="txInstallmentFields" class="installment-fields hidden">
@@ -351,13 +349,17 @@
       <div class="sheet-handle"></div>
       <h3 id="cardModalTitle">Novo cartão</h3>
       <form id="cardForm" class="form">
-        <input type="hidden" id="cardId" />
+        <input type="hidden" id="creditCardEditId" />
         <label class="field"><span>Nome do cartão</span><input type="text" id="cardName" placeholder="Ex: Nubank" required /></label>
         <label class="field"><span>Limite de crédito</span><input type="text" inputmode="decimal" id="cardLimit" placeholder="0,00" required /></label>
         <label class="field"><span>Fatura atual</span><input type="text" inputmode="decimal" id="cardStatement" placeholder="0,00" required /></label>
+        <label class="field"><span>Dia de fechamento da fatura</span>
+          <select id="cardClosingDay" required></select>
+        </label>
         <label class="field"><span>Dia do vencimento da fatura</span>
           <select id="cardDueDay" required></select>
         </label>
+        <p class="muted installment-hint">Compras após o fechamento entram na próxima fatura. O vencimento é quando você paga a fatura.</p>
         <div class="row gap">
           <button type="button" class="btn ghost block" data-close>Cancelar</button>
           <button type="submit" class="btn primary block">Salvar</button>

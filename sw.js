@@ -2,7 +2,7 @@
  * Estratégia: precache do app shell + cache-first com fallback para network.
  * Versione o CACHE_NAME a cada release para forçar atualização.
  */
-const CACHE_NAME = "financas-pwa-v2.1.0";
+const CACHE_NAME = "financas-pwa-v2.2.0";
 const APP_SHELL = [
   "./",
   "./index.html",

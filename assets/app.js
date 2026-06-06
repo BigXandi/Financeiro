@@ -29,9 +29,17 @@
     saude: "💊", educacao: "📚", compras: "🛍️", outros: "🔹"
   };
 
-  /** @typedef {{ id:string, type:"income"|"expense", amount:number, description:string, categoryId:string, date:string, status?:"paid"|"pending", cardId?:string, installmentGroupId?:string, installmentNumber?:number, installmentTotal?:number }} Tx */
+  /** @typedef {{ id:string, type:"income"|"expense", amount:number, description:string, categoryId:string, date:string, status?:"paid"|"pending", paymentMethod?:"cash"|"pix"|"debit"|"transfer"|"card", cardId?:string, installmentGroupId?:string, installmentNumber?:number, installmentTotal?:number }} Tx */
   /** @typedef {{ id:string, name:string, target:number, current:number, deadline?:string }} Goal */
-  /** @typedef {{ id:string, name:string, limit:number, statementBalance:number, dueDay:number }} CreditCard */
+  /** @typedef {{ id:string, name:string, limit:number, statementBalance:number, closingDay:number, dueDay:number }} CreditCard */
+
+  const PAYMENT_LABELS = {
+    cash: "Dinheiro",
+    pix: "PIX",
+    debit: "Débito",
+    transfer: "Transferência",
+    card: "Crédito"
+  };
 
   let state = {
     userName: "",
@@ -55,7 +63,15 @@
         if (raw) {
           const data = JSON.parse(raw);
           state = { ...state, ...data, creditCards: data.creditCards || [] };
-          state.transactions = (state.transactions || []).map(t => ({ ...t, status: t.status || "paid" }));
+          state.creditCards = (state.creditCards || []).map(c => ({
+            ...c,
+            closingDay: c.closingDay || Math.max(1, (c.dueDay || 10) - 7)
+          }));
+          state.transactions = (state.transactions || []).map(t => ({
+            ...t,
+            status: t.status || "paid",
+            paymentMethod: t.paymentMethod || (t.cardId ? "card" : undefined)
+          }));
           saveState();
           return;
         }
@@ -67,7 +83,15 @@
         state.categories = DEFAULT_CATEGORIES.slice();
       }
       if (!state.creditCards) state.creditCards = [];
-      state.transactions = (state.transactions || []).map(t => ({ ...t, status: t.status || "paid" }));
+      state.creditCards = state.creditCards.map(c => ({
+        ...c,
+        closingDay: c.closingDay || Math.max(1, (c.dueDay || 10) - 7)
+      }));
+      state.transactions = (state.transactions || []).map(t => ({
+        ...t,
+        status: t.status || "paid",
+        paymentMethod: t.paymentMethod || (t.cardId ? "card" : undefined)
+      }));
       state.currentMonth = monthKey(new Date());
     } catch (e) {
       console.error("Erro lendo localStorage", e);
@@ -174,23 +198,81 @@
     return `${y}-${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
   }
 
-  function cardPendingTotal(cardId) {
-    return state.transactions
-      .filter(t => t.cardId === cardId && t.type === "expense" && isPending(t))
-      .reduce((s, t) => s + t.amount, 0);
+  function cardClosingDay(card) {
+    return Math.min(card.closingDay || Math.max(1, (card.dueDay || 10) - 7), 28);
   }
 
-  function cardProjectedBalance(card) {
-    return (card.statementBalance || 0) + cardPendingTotal(card.id);
+  function nextOnDayIso(day, ref = new Date()) {
+    const d = Math.min(day, 28);
+    const y = ref.getFullYear();
+    const m = ref.getMonth();
+    let target = new Date(y, m, d);
+    const today = new Date(ref.getFullYear(), ref.getMonth(), ref.getDate());
+    if (target < today) target = new Date(y, m + 1, d);
+    return isoFromParts(target.getFullYear(), target.getMonth() + 1, target.getDate());
   }
 
   function nextCardDueIso(card, ref = new Date()) {
-    const y = ref.getFullYear();
-    const m = ref.getMonth();
-    const day = Math.min(card.dueDay, 28);
-    let due = new Date(y, m, day);
-    if (due < ref) due = new Date(y, m + 1, day);
-    return isoFromParts(due.getFullYear(), due.getMonth() + 1, due.getDate());
+    return nextOnDayIso(card.dueDay || 10, ref);
+  }
+
+  function nextCardClosingIso(card, ref = new Date()) {
+    return nextOnDayIso(cardClosingDay(card), ref);
+  }
+
+  function prevCardClosingIso(card, ref = new Date()) {
+    const next = nextCardClosingIso(card, ref);
+    const [y, m, d] = next.split("-").map(Number);
+    const prev = new Date(y, m - 2, d);
+    return isoFromParts(prev.getFullYear(), prev.getMonth() + 1, d);
+  }
+
+  function isInCurrentBillingCycle(dateIso, card, ref = new Date()) {
+    const prev = prevCardClosingIso(card, ref);
+    const next = nextCardClosingIso(card, ref);
+    return dateIso > prev && dateIso <= next;
+  }
+
+  function cardPendingByCycle(card) {
+    let current = 0;
+    let next = 0;
+    state.transactions
+      .filter(t => t.cardId === card.id && t.type === "expense" && isPending(t))
+      .forEach(t => {
+        if (isInCurrentBillingCycle(t.date, card)) current += t.amount;
+        else next += t.amount;
+      });
+    return { current, next, total: current + next };
+  }
+
+  function cardPendingTotal(cardId) {
+    const card = cardById(cardId);
+    if (!card) return 0;
+    return cardPendingByCycle(card).total;
+  }
+
+  function cardProjectedBalance(card) {
+    const { current } = cardPendingByCycle(card);
+    return (card.statementBalance || 0) + current;
+  }
+
+  function paymentLabel(tx) {
+    if (tx.cardId) {
+      const card = cardById(tx.cardId);
+      return card ? `💳 ${card.name}` : PAYMENT_LABELS.card;
+    }
+    return PAYMENT_LABELS[tx.paymentMethod] || "";
+  }
+
+  function parsePaymentSelect(val) {
+    if (!val) return { paymentMethod: undefined, cardId: undefined };
+    if (val.startsWith("card:")) return { paymentMethod: "card", cardId: val.slice(5) };
+    return { paymentMethod: val, cardId: undefined };
+  }
+
+  function paymentSelectValue(tx) {
+    if (tx.cardId) return `card:${tx.cardId}`;
+    return tx.paymentMethod || "";
   }
 
   function toast(msg, ms = 2200) {
@@ -392,7 +474,7 @@
     const cat = categoryById(tx.categoryId);
     const icon = CATEGORY_ICONS[cat.id] || (tx.type === "income" ? "💰" : "💸");
     const sign = tx.type === "income" ? "+" : "−";
-    const card = tx.cardId ? cardById(tx.cardId) : null;
+    const pay = paymentLabel(tx);
     const inst = tx.installmentTotal > 1 ? ` · ${tx.installmentNumber}/${tx.installmentTotal}` : "";
     const dateLabel = isPending(tx) ? `Vence ${formatDate(tx.date)}` : formatDate(tx.date);
     const pendingCls = isPending(tx) ? " pending" : "";
@@ -401,7 +483,7 @@
         <div class="tx-icon ${tx.type}">${icon}</div>
         <div class="tx-body">
           <div class="tx-desc">${escapeHtml(tx.description)}${txStatusBadge(tx)}</div>
-          <div class="tx-meta">${cat.name}${card ? " · " + escapeHtml(card.name) : ""}${inst} · ${dateLabel}</div>
+          <div class="tx-meta">${cat.name}${pay ? " · " + escapeHtml(pay) : ""}${inst} · ${dateLabel}</div>
         </div>
         <div class="tx-amount ${tx.type}">${sign}${formatMoney(tx.amount)}</div>
       </li>`;
@@ -464,10 +546,32 @@
     sel.innerHTML = opts.map(c => `<option value="${c.id}">${c.name}</option>`).join("");
   }
 
-  function refreshTxCardSelect() {
-    const sel = document.getElementById("txCard");
-    sel.innerHTML = `<option value="">Nenhum</option>` +
-      state.creditCards.map(c => `<option value="${c.id}">${escapeHtml(c.name)}</option>`).join("");
+  function refreshTxPaymentSelect() {
+    const type = document.getElementById("txType").value;
+    const sel = document.getElementById("txPayment");
+    if (!sel) return;
+    const label = document.getElementById("txPaymentLabel");
+    if (label) label.textContent = type === "income" ? "Forma de recebimento" : "Forma de pagamento";
+
+    let html = `<option value="">Não informado</option>`;
+    if (type === "income") {
+      html += `
+        <option value="pix">PIX</option>
+        <option value="cash">Dinheiro</option>
+        <option value="transfer">Transferência</option>
+        <option value="debit">Débito</option>`;
+    } else {
+      html += `
+        <option value="pix">PIX</option>
+        <option value="cash">Dinheiro</option>
+        <option value="debit">Débito</option>`;
+      if (state.creditCards.length) {
+        html += `<optgroup label="Cartões de crédito">` +
+          state.creditCards.map(c => `<option value="card:${c.id}">💳 ${escapeHtml(c.name)}</option>`).join("") +
+          `</optgroup>`;
+      }
+    }
+    sel.innerHTML = html;
   }
 
   function setTxStatus(status) {
@@ -478,7 +582,14 @@
     const pending = status === "pending";
     document.getElementById("txDateLabel").textContent = pending ? "Data de vencimento" : "Data";
     document.getElementById("txInstallmentFields").classList.toggle("hidden", !pending);
-    document.getElementById("txCardField").classList.toggle("hidden", document.getElementById("txType").value === "income");
+    syncTxPaymentVisibility();
+  }
+
+  function syncTxPaymentVisibility() {
+    const type = document.getElementById("txType").value;
+    const field = document.getElementById("txPaymentField");
+    if (field) field.classList.remove("hidden");
+    if (type === "income") refreshTxPaymentSelect();
   }
 
   function openTxModal(id, opts = {}) {
@@ -488,7 +599,7 @@
     const payBtn = document.getElementById("txPayBtn");
     const form = document.getElementById("txForm");
     form.reset();
-    refreshTxCardSelect();
+    refreshTxPaymentSelect();
 
     if (id) {
       const tx = state.transactions.find(t => t.id === id);
@@ -504,7 +615,8 @@
       document.getElementById("txCategory").value = tx.categoryId;
       document.getElementById("txDate").value = tx.date;
       setTxStatus(txStatus(tx));
-      document.getElementById("txCard").value = tx.cardId || "";
+      refreshTxPaymentSelect();
+      document.getElementById("txPayment").value = paymentSelectValue(tx);
       document.getElementById("txInstallments").value = "1";
       document.getElementById("txInstallmentFields").classList.add("hidden");
     } else {
@@ -518,7 +630,7 @@
       refreshTxCategorySelect();
       document.getElementById("txInstallments").value = "1";
     }
-    document.getElementById("txCardField").classList.toggle("hidden", document.getElementById("txType").value === "income");
+    syncTxPaymentVisibility();
     openModal(modal);
   }
 
@@ -528,21 +640,26 @@
       b.classList.toggle("active", b.dataset.type === type)
     );
     refreshTxCategorySelect();
-    document.getElementById("txCardField").classList.toggle("hidden", type === "income");
+    refreshTxPaymentSelect();
+    syncTxPaymentVisibility();
   }
 
   function buildTxFromForm() {
     const status = document.getElementById("txStatusSwitch").dataset.status || "paid";
-    const cardId = document.getElementById("txCard").value || undefined;
-    return {
+    const payment = parsePaymentSelect(document.getElementById("txPayment").value);
+    const tx = {
       type: document.getElementById("txType").value,
       amount: parseAmount(document.getElementById("txAmount").value),
       description: document.getElementById("txDescription").value.trim() || "Sem descrição",
       categoryId: document.getElementById("txCategory").value,
       date: document.getElementById("txDate").value || todayIso(),
       status,
-      cardId: status === "pending" ? cardId : (cardId || undefined)
+      paymentMethod: payment.paymentMethod,
+      cardId: payment.cardId
     };
+    if (!tx.cardId) delete tx.cardId;
+    if (!tx.paymentMethod) delete tx.paymentMethod;
+    return tx;
   }
 
   function updateCardStatement(cardId, delta) {
@@ -561,10 +678,10 @@
       const tx = { ...prev, ...base, id };
       const idx = state.transactions.findIndex(t => t.id === id);
       state.transactions[idx] = tx;
-      if (prev?.cardId && prev.type === "expense" && !isPending(prev)) {
+      if (prev?.cardId && prev.type === "expense" && !isPending(prev) && prev.paymentMethod === "card") {
         updateCardStatement(prev.cardId, -prev.amount);
       }
-      if (tx.cardId && tx.type === "expense" && !isPending(tx)) {
+      if (tx.cardId && tx.type === "expense" && !isPending(tx) && tx.paymentMethod === "card") {
         updateCardStatement(tx.cardId, tx.amount);
       }
       toast(isPending(tx) ? "Agendamento atualizado." : "Transação atualizada.");
@@ -593,7 +710,7 @@
       } else {
         const tx = { id: uid(), ...base };
         state.transactions.push(tx);
-        if (tx.cardId && tx.type === "expense" && !isPending(tx)) {
+        if (tx.cardId && tx.type === "expense" && !isPending(tx) && tx.paymentMethod === "card") {
           updateCardStatement(tx.cardId, tx.amount);
         }
         if (isPending(tx) && tx.cardId) {
@@ -616,7 +733,7 @@
     if (!tx || !isPending(tx)) return;
     tx.status = "paid";
     tx.date = todayIso();
-    if (tx.cardId && tx.type === "expense") {
+    if (tx.cardId && tx.type === "expense" && tx.paymentMethod === "card") {
       updateCardStatement(tx.cardId, tx.amount);
     }
     saveState();
@@ -637,7 +754,7 @@
     if (tx.installmentGroupId) {
       state.transactions = state.transactions.filter(t => t.installmentGroupId !== tx.installmentGroupId);
     } else {
-      if (tx.cardId && tx.type === "expense" && !isPending(tx)) {
+      if (tx.cardId && tx.type === "expense" && !isPending(tx) && tx.paymentMethod === "card") {
         updateCardStatement(tx.cardId, -tx.amount);
       }
       state.transactions = state.transactions.filter(t => t.id !== id);
@@ -681,13 +798,23 @@
     });
 
     state.creditCards.forEach(card => {
-      const day = Math.min(card.dueDay, 28);
-      const date = isoFromParts(y, m, day);
+      const dueDay = Math.min(card.dueDay, 28);
+      const closeDay = cardClosingDay(card);
+      const dueDate = isoFromParts(y, m, dueDay);
+      const closeDate = isoFromParts(y, m, closeDay);
       const projected = cardProjectedBalance(card);
       events.push({
-        date,
+        date: closeDate,
+        kind: "card-close",
+        label: `Fechamento ${card.name}`,
+        amount: projected,
+        type: "card",
+        id: card.id
+      });
+      events.push({
+        date: dueDate,
         kind: "card",
-        label: `Fatura ${card.name}`,
+        label: `Vencimento ${card.name}`,
         amount: projected,
         type: "card",
         id: card.id
@@ -732,7 +859,7 @@
 
       const dots = dayEvents.slice(0, 4).map(ev => {
         let cls = "expense";
-        if (ev.kind === "card") cls = "card";
+        if (ev.kind === "card" || ev.kind === "card-close") cls = "card";
         else if (ev.kind === "income") cls = "income";
         else if (ev.overdue || ev.kind === "overdue") cls = "overdue";
         return `<span class="cal-dot ${cls}"></span>`;
@@ -825,7 +952,7 @@
     empty.classList.add("hidden");
     list.innerHTML = pending.map(tx => {
       const cat = categoryById(tx.categoryId);
-      const card = tx.cardId ? cardById(tx.cardId) : null;
+      const pay = paymentLabel(tx);
       const overdue = isOverdue(tx);
       const inst = tx.installmentTotal > 1 ? `Parcela ${tx.installmentNumber}/${tx.installmentTotal}` : "";
       return `
@@ -835,7 +962,7 @@
             <span class="${tx.type}">${tx.type === "income" ? "+" : "−"}${formatMoney(tx.amount)}</span>
           </div>
           <div class="planned-meta">
-            <span>${cat.name}${card ? " · " + escapeHtml(card.name) : ""}</span>
+            <span>${cat.name}${pay ? " · " + escapeHtml(pay) : ""}</span>
             <span>${overdue ? "⚠ Atrasado · " : ""}Vence ${formatDate(tx.date)}${inst ? " · " + inst : ""}</span>
           </div>
           <div class="planned-actions">
@@ -867,7 +994,7 @@
     if (!tx || !isPending(tx)) return;
     tx.status = "paid";
     tx.date = todayIso();
-    if (tx.cardId && tx.type === "expense") {
+    if (tx.cardId && tx.type === "expense" && tx.paymentMethod === "card") {
       updateCardStatement(tx.cardId, tx.amount);
     }
     saveState();
@@ -886,27 +1013,33 @@
     empty.classList.add("hidden");
     list.innerHTML = state.creditCards.map(card => {
       const used = card.statementBalance || 0;
-      const pending = cardPendingTotal(card.id);
-      const projected = used + pending;
+      const cycles = cardPendingByCycle(card);
+      const projected = used + cycles.current;
       const limit = card.limit || 1;
       const pct = Math.min(100, (projected / limit) * 100);
       const available = limit - projected;
       const over = projected > limit;
       const dueIso = nextCardDueIso(card);
-      const dueLabel = `Próx. vencimento: ${formatDate(dueIso)}`;
-      const projectionHtml = pending > 0
-        ? `<div class="card-projection">Projeção: <strong>${formatMoney(projected)}</strong> (${formatMoney(used)} fatura + ${formatMoney(pending)} agendado) · Disponível projetado: <strong>${formatMoney(available)}</strong></div>`
+      const closeIso = nextCardClosingIso(card);
+      const dueLabel = `Fecha ${formatDate(closeIso)} · Vence ${formatDate(dueIso)}`;
+      const projectionHtml = cycles.total > 0
+        ? `<div class="card-projection">
+            Projeção fatura: <strong>${formatMoney(projected)}</strong>
+            (${formatMoney(used)} atual + ${formatMoney(cycles.current)} neste ciclo)
+            ${cycles.next > 0 ? ` · Próximo ciclo: ${formatMoney(cycles.next)}` : ""}
+            · Disponível: <strong>${formatMoney(available)}</strong>
+          </div>`
         : "";
       return `
         <li class="credit-card-item" data-card="${card.id}">
           <div class="card-head">
             <span>💳 ${escapeHtml(card.name)}</span>
-            <span>${formatMoney(pending > 0 ? projected : used)}</span>
+            <span>${formatMoney(cycles.total > 0 ? projected : used)}</span>
           </div>
           <div class="card-limit-bar${over ? " over" : ""}"><span style="width:${pct}%"></span></div>
           <div class="card-meta">
             <span>Fatura / Limite: ${formatMoney(used)} / ${formatMoney(limit)}</span>
-            <span>Disponível: ${formatMoney(limit - (pending > 0 ? projected : used))}</span>
+            <span>Disponível: ${formatMoney(limit - (cycles.total > 0 ? projected : used))}</span>
           </div>
           <div class="card-meta"><span>${dueLabel}</span></div>
           ${projectionHtml}
@@ -918,48 +1051,67 @@
     });
   }
 
-  function populateDueDaySelect() {
-    const sel = document.getElementById("cardDueDay");
-    if (sel.options.length) return;
+  function populateDaySelect(selectId) {
+    const sel = document.getElementById(selectId);
+    if (!sel || sel.options.length) return;
     sel.innerHTML = Array.from({ length: 28 }, (_, i) => {
       const d = i + 1;
       return `<option value="${d}">Dia ${d}</option>`;
     }).join("");
   }
 
+  function initCardForm() {
+    populateDaySelect("cardDueDay");
+    populateDaySelect("cardClosingDay");
+  }
+
   function openCardModal(id) {
-    populateDueDaySelect();
+    initCardForm();
+    const modal = document.getElementById("cardModal");
     const form = document.getElementById("cardForm");
     const delBtn = document.getElementById("cardDeleteBtn");
+    if (!modal || !form) {
+      toast("Não foi possível abrir o cadastro de cartão.");
+      return;
+    }
+
     form.reset();
+    initCardForm();
+
     if (id) {
       const card = cardById(id);
       if (!card) return;
       document.getElementById("cardModalTitle").textContent = "Editar cartão";
-      document.getElementById("cardId").value = card.id;
+      document.getElementById("creditCardEditId").value = card.id;
       document.getElementById("cardName").value = card.name;
       document.getElementById("cardLimit").value = card.limit.toFixed(2).replace(".", ",");
       document.getElementById("cardStatement").value = card.statementBalance.toFixed(2).replace(".", ",");
+      document.getElementById("cardClosingDay").value = String(cardClosingDay(card));
       document.getElementById("cardDueDay").value = String(card.dueDay);
       delBtn.classList.remove("hidden");
     } else {
       document.getElementById("cardModalTitle").textContent = "Novo cartão";
-      document.getElementById("cardId").value = "";
+      document.getElementById("creditCardEditId").value = "";
+      document.getElementById("cardClosingDay").value = "3";
       document.getElementById("cardDueDay").value = "10";
       delBtn.classList.add("hidden");
     }
-    openModal(document.getElementById("cardModal"));
+    openModal(modal);
+    setTimeout(() => document.getElementById("cardName")?.focus(), 80);
   }
 
   function submitCard(e) {
     e.preventDefault();
-    const id = document.getElementById("cardId").value;
+    const id = document.getElementById("creditCardEditId").value;
+    const closingDay = parseInt(document.getElementById("cardClosingDay").value, 10) || 3;
+    const dueDay = parseInt(document.getElementById("cardDueDay").value, 10) || 10;
     const card = {
       id: id || uid(),
       name: document.getElementById("cardName").value.trim() || "Cartão",
       limit: parseAmount(document.getElementById("cardLimit").value),
       statementBalance: parseAmount(document.getElementById("cardStatement").value),
-      dueDay: parseInt(document.getElementById("cardDueDay").value, 10) || 10
+      closingDay,
+      dueDay
     };
     if (card.limit <= 0) { toast("Informe um limite válido."); return; }
     if (id) {
@@ -972,12 +1124,12 @@
     }
     saveState();
     closeAllModals();
-    renderPlanning();
-    refreshTxCardSelect();
+    renderAll();
+    refreshTxPaymentSelect();
   }
 
   function deleteCard() {
-    const id = document.getElementById("cardId").value;
+    const id = document.getElementById("creditCardEditId").value;
     if (!id) return;
     if (!confirm("Excluir este cartão? Transações vinculadas perderão a referência.")) return;
     state.creditCards = state.creditCards.filter(c => c.id !== id);
@@ -1264,19 +1416,34 @@
   }
 
   /* ------------------ Eventos ------------------ */
+  function on(id, event, handler) {
+    const el = document.getElementById(id);
+    if (el) el.addEventListener(event, handler);
+  }
+
   function bindEvents() {
-    document.getElementById("themeToggle").addEventListener("click", toggleTheme);
+    on("themeToggle", "click", toggleTheme);
 
     document.querySelectorAll("[data-go]").forEach(el => {
       el.addEventListener("click", () => showScreen(el.dataset.go));
     });
 
-    document.getElementById("prevMonth").addEventListener("click", () => changeMonth(-1));
-    document.getElementById("nextMonth").addEventListener("click", () => changeMonth(1));
-    document.getElementById("calPrevMonth").addEventListener("click", () => changeMonth(-1));
-    document.getElementById("calNextMonth").addEventListener("click", () => changeMonth(1));
+    on("prevMonth", "click", () => changeMonth(-1));
+    on("nextMonth", "click", () => changeMonth(1));
+    on("calPrevMonth", "click", () => changeMonth(-1));
+    on("calNextMonth", "click", () => changeMonth(1));
 
-    document.getElementById("fabAdd").addEventListener("click", () => openTxModal());
+    const planning = document.getElementById("screen-planning");
+    if (planning) {
+      planning.addEventListener("click", e => {
+        if (e.target.closest("#addCardBtn")) {
+          e.preventDefault();
+          openCardModal();
+        }
+      });
+    }
+
+    on("fabAdd", "click", () => openTxModal());
 
     document.querySelectorAll("#txTypeSwitch button").forEach(b => {
       b.addEventListener("click", () => setTxType(b.dataset.type));
@@ -1286,15 +1453,15 @@
       b.addEventListener("click", () => setTxStatus(b.dataset.status));
     });
 
-    document.getElementById("txForm").addEventListener("submit", submitTx);
-    document.getElementById("txDeleteBtn").addEventListener("click", deleteTx);
-    document.getElementById("txPayBtn").addEventListener("click", markTxAsPaid);
+    on("txForm", "submit", submitTx);
+    on("txDeleteBtn", "click", deleteTx);
+    on("txPayBtn", "click", markTxAsPaid);
 
     document.querySelectorAll("[data-close]").forEach(el => {
       el.addEventListener("click", closeAllModals);
     });
 
-    document.getElementById("searchInput").addEventListener("input", e => {
+    on("searchInput", "input", e => {
       txFilter.q = e.target.value;
       renderTransactions();
     });
@@ -1307,35 +1474,34 @@
       });
     });
 
-    document.getElementById("addPlannedBtn").addEventListener("click", () => openTxModal(null, { planned: true }));
-    document.getElementById("addCardBtn").addEventListener("click", () => openCardModal());
-    document.getElementById("cardForm").addEventListener("submit", submitCard);
-    document.getElementById("cardDeleteBtn").addEventListener("click", deleteCard);
+    on("addPlannedBtn", "click", () => openTxModal(null, { planned: true }));
+    on("addCardBtn", "click", e => { e.preventDefault(); openCardModal(); });
+    on("emptyAddCardBtn", "click", e => { e.preventDefault(); openCardModal(); });
+    on("cardForm", "submit", submitCard);
+    on("cardDeleteBtn", "click", deleteCard);
 
-    document.getElementById("addBudgetBtn").addEventListener("click", () => openBudgetModal());
-    document.getElementById("budgetForm").addEventListener("submit", submitBudget);
+    on("addBudgetBtn", "click", () => openBudgetModal());
+    on("budgetForm", "submit", submitBudget);
 
-    document.getElementById("addGoalBtn").addEventListener("click", () => openGoalModal());
-    document.getElementById("goalForm").addEventListener("submit", submitGoal);
-    document.getElementById("goalDeleteBtn").addEventListener("click", deleteGoal);
+    on("addGoalBtn", "click", () => openGoalModal());
+    on("goalForm", "submit", submitGoal);
+    on("goalDeleteBtn", "click", deleteGoal);
 
-    document.getElementById("userName").addEventListener("change", e => {
+    on("userName", "change", e => {
       state.userName = e.target.value.trim(); saveState(); renderGreeting();
     });
-    document.getElementById("currencySelect").addEventListener("change", e => {
+    on("currencySelect", "change", e => {
       state.currency = e.target.value; saveState(); renderAll();
     });
-    document.getElementById("addCategoryBtn").addEventListener("click", addCategory);
+    on("addCategoryBtn", "click", addCategory);
 
-    document.getElementById("exportBtn").addEventListener("click", exportData);
-    document.getElementById("importBtn").addEventListener("click", () =>
-      document.getElementById("importFile").click()
-    );
-    document.getElementById("importFile").addEventListener("change", e => {
+    on("exportBtn", "click", exportData);
+    on("importBtn", "click", () => document.getElementById("importFile")?.click());
+    on("importFile", "change", e => {
       const f = e.target.files?.[0]; if (f) importData(f);
       e.target.value = "";
     });
-    document.getElementById("resetBtn").addEventListener("click", resetData);
+    on("resetBtn", "click", resetData);
 
     matchMedia("(prefers-color-scheme: dark)").addEventListener?.("change", () => {
       if (state.theme === "auto") applyTheme("auto");
@@ -1349,6 +1515,7 @@
   /* ------------------ Boot ------------------ */
   function boot() {
     loadState();
+    initCardForm();
     applyTheme(state.theme || "auto");
     bindEvents();
     renderAll();
